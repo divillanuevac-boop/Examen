@@ -1,0 +1,74 @@
+name: CI/CD Pipeline VZeta
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Build and Push App Image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USER }}/myapp_container:latest
+
+      - name: Build and Push Nginx Image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile-nginx
+          push: true
+          tags: ${{ secrets.DOCKER_USER }}/mynginx_container:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Crear red interna de Docker si no existe
+            docker network create vzeta_net || true
+            
+            # Crear directorio para la persistencia en el host si no existe
+            mkdir -p ~/html_persistence
+            
+            # Detener y eliminar contenedores antiguos
+            docker stop mynginx_container myapp_container || true
+            docker rm mynginx_container myapp_container || true
+            
+            # Descargar las últimas imágenes desde Docker Hub
+            docker pull ${{ secrets.DOCKER_USER }}/myapp_container:latest
+            docker pull ${{ secrets.DOCKER_USER }}/mynginx_container:latest
+            
+            # Desplegar la aplicación con Bind Mount para persistencia de datos
+            docker run -d --name myapp_container \
+              --network vzeta_net \
+              -v ~/html_persistence:/usr/share/nginx/html \
+              ${{ secrets.DOCKER_USER }}/myapp_container:latest
+            
+            # Copiar el archivo index inicial al volumen por si está vacío
+            docker cp /usr/share/nginx/html/index.html myapp_container:/usr/share/nginx/html/ || true
+            
+            # Desplegar Nginx Reverse Proxy escuchando en el puerto 80 público
+            docker run -d --name mynginx_container \
+              --network vzeta_net \
+              -p 80:80 \
+              ${{ secrets.DOCKER_USER }}/mynginx_container:latest
